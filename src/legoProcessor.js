@@ -47,65 +47,6 @@ function pickLineBaseColor(palette) {
   );
 }
 
-function colorKey(color) {
-  return color.rgb.join(",");
-}
-
-function smoothIsolatedCells(grid, passes = 1, minMajority = 5) {
-  if (!grid.length || !grid[0]?.length) return grid;
-
-  const height = grid.length;
-  const width = grid[0].length;
-  const directions = [
-    [-1, -1], [0, -1], [1, -1],
-    [-1, 0],           [1, 0],
-    [-1, 1],  [0, 1],  [1, 1],
-  ];
-
-  let current = grid.map((row) => [...row]);
-
-  for (let pass = 0; pass < passes; pass++) {
-    const next = current.map((row) => [...row]);
-
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const counts = new Map();
-
-        for (const [dx, dy] of directions) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-
-          const neighborColor = current[ny][nx];
-          const key = colorKey(neighborColor);
-          if (!counts.has(key)) {
-            counts.set(key, { count: 0, color: neighborColor });
-          }
-          counts.get(key).count += 1;
-        }
-
-        let best = null;
-        for (const item of counts.values()) {
-          if (!best || item.count > best.count) {
-            best = item;
-          }
-        }
-
-        if (!best) continue;
-
-        const selfKey = colorKey(current[y][x]);
-        if (best.count >= minMajority && best.color && colorKey(best.color) !== selfKey) {
-          next[y][x] = best.color;
-        }
-      }
-    }
-
-    current = next;
-  }
-
-  return current;
-}
-
 function pickDiverseColors(candidates, maxColors, minDistance = 52) {
   if (!candidates.length || maxColors <= 0) return [];
 
@@ -332,12 +273,10 @@ export function processImage(image, gridSize, palette = defaultPalette) {
     }
   }
 
-  const smoothed = smoothIsolatedCells(result, 1, 5);
-
   const countsByColor = new Map();
   for (let y = 0; y < gridSize; y++) {
     for (let x = 0; x < gridSize; x++) {
-      const color = smoothed[y][x];
+      const color = result[y][x];
       const key = color.rgb.join(",");
       if (!countsByColor.has(key)) {
         countsByColor.set(key, { rgb: [...color.rgb], count: 0 });
@@ -348,5 +287,5 @@ export function processImage(image, gridSize, palette = defaultPalette) {
 
   const counts = [...countsByColor.values()].sort((a, b) => b.count - a.count);
 
-  return { grid: smoothed, counts };
+  return { grid: result, counts };
 }
