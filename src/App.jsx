@@ -1,89 +1,37 @@
 import { useEffect, useRef, useState } from "react";
 import { extractDominantColors, processImage } from "./legoProcessor";
 import { palette as defaultPalette } from "./palette";
-
-function toHex(value) {
-  return value.toString(16).padStart(2, "0");
-}
-
-function rgbToHex(rgb) {
-  return `#${toHex(rgb[0])}${toHex(rgb[1])}${toHex(rgb[2])}`;
-}
-
-function hexToRgb(hex) {
-  return [
-    parseInt(hex.slice(1, 3), 16),
-    parseInt(hex.slice(3, 5), 16),
-    parseInt(hex.slice(5, 7), 16),
-  ];
-}
-
-function createAdjustedCanvas(image, brightness, contrast, saturation) {
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
-
-  canvas.width = image.width;
-  canvas.height = image.height;
-  ctx.filter = `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturation}%)`;
-  ctx.drawImage(image, 0, 0);
-  ctx.filter = "none";
-
-  return canvas;
-}
-
-function extractGrayscaleRecommendations(image, steps = 7) {
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return [];
-
-  const maxSampleSize = 120;
-  const scale = Math.min(
-    1,
-    maxSampleSize / Math.max(image.width, image.height)
-  );
-  const width = Math.max(1, Math.round(image.width * scale));
-  const height = Math.max(1, Math.round(image.height * scale));
-
-  canvas.width = width;
-  canvas.height = height;
-  ctx.drawImage(image, 0, 0, width, height);
-
-  const { data } = ctx.getImageData(0, 0, width, height);
-  const values = [];
-
-  for (let i = 0; i < data.length; i += 4) {
-    const alpha = data[i + 3];
-    if (alpha < 16) continue;
-    const gray = Math.round(data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
-    values.push(gray);
-  }
-
-  if (!values.length) return [];
-
-  values.sort((a, b) => a - b);
-  const recommendations = [];
-
-  for (let i = 0; i < steps; i++) {
-    const quantile = steps === 1 ? 0 : i / (steps - 1);
-    const index = Math.min(values.length - 1, Math.round(quantile * (values.length - 1)));
-    const gray = values[index];
-    recommendations.push({
-      rgb: [gray, gray, gray],
-      count: 1,
-      ratio: 1 / steps,
-    });
-  }
-
-  return recommendations;
-}
+import PaletteSection from "./components/PaletteSection";
+import RealSizePreviewModal from "./components/RealSizePreviewModal";
+import { hexToRgb, rgbToHex } from "./utils/colorUtils";
+import { buildCountsFromGrid, cloneGrid } from "./utils/gridUtils";
+import {
+  createAdjustedCanvas,
+  extractGrayscaleRecommendations,
+} from "./utils/imageUtils";
 
 function App() {
   const sampleCanvasRef = useRef(null);
+  const realSizeModalRef = useRef(null);
+  const realSizeViewportRef = useRef(null);
+  const realSizePanStartRef = useRef(null);
   const [image, setImage] = useState(null);
   const [grid, setGrid] = useState(null);
+  const [originalGrid, setOriginalGrid] = useState(null);
+  const [gridHistory, setGridHistory] = useState([]);
   const [counts, setCounts] = useState([]);
   const [selectedBrickHexes, setSelectedBrickHexes] = useState([]);
+  const [selectedCellKeys, setSelectedCellKeys] = useState([]);
+  const [paintMode, setPaintMode] = useState("add");
+  const [paintTool, setPaintTool] = useState("brush");
+  const [brushSize, setBrushSize] = useState(2);
+  const [isPainting, setIsPainting] = useState(false);
+  const [isRealSizePreviewOpen, setIsRealSizePreviewOpen] = useState(false);
+  const [isRealSizeFullscreen, setIsRealSizeFullscreen] = useState(false);
+  const [isRealSizeDragging, setIsRealSizeDragging] = useState(false);
+  const [realSizeScalePercent, setRealSizeScalePercent] = useState(100);
+  const [targetColorHex, setTargetColorHex] = useState("");
+  const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [size, setSize] = useState(48);
   const [brickSizeMm, setBrickSizeMm] = useState(8);
   const [brightness, setBrightness] = useState(100);
@@ -103,10 +51,69 @@ function App() {
   const activeColorCount = palette.filter((color) => color.enabled).length;
   const activePalette = palette.filter((color) => color.enabled);
   const selectedBrickHexSet = new Set(selectedBrickHexes);
+  const selectedCellKeySet = new Set(selectedCellKeys);
+  const brushMax = Math.max(1, Math.min(48, size));
   const pieceCountPerSide = grid?.[0]?.length || size;
   const finalWidthMm = pieceCountPerSide * brickSizeMm;
   const finalHeightMm = pieceCountPerSide * brickSizeMm;
+  const totalBrickCount = counts.reduce((sum, item) => sum + item.count, 0);
   const previewWidth = "min(480px, 90vw)";
+  const cssPxPerMm = 96 / 25.4;
+  const lego98138PitchMm = 8;
+  const lego98138OuterDiameterMm = 7.8;
+  const lego65803StudsPerSide = 16;
+  const realSizePitchPx = Math.max(
+    1,
+    lego98138PitchMm * cssPxPerMm * (realSizeScalePercent / 100)
+  );
+  const realSizeBrickOuterDiameterPx = Math.max(
+    1,
+    lego98138OuterDiameterMm * cssPxPerMm * (realSizeScalePercent / 100)
+  );
+  const realSizeGridWidthPx = (grid?.[0]?.length || 0) * realSizePitchPx;
+  const realSizeGridHeightPx = (grid?.length || 0) * realSizePitchPx;
+  const realSizeModelWidthMm = (grid?.[0]?.length || 0) * lego98138PitchMm;
+  const realSizeModelHeightMm = (grid?.length || 0) * lego98138PitchMm;
+  const realSizeBaseplateStepPx = lego65803StudsPerSide * realSizePitchPx;
+  const realSizeBaseplateCols = Math.ceil((grid?.[0]?.length || 0) / lego65803StudsPerSide);
+  const realSizeBaseplateRows = Math.ceil((grid?.length || 0) / lego65803StudsPerSide);
+  const realSizeBaseplateCount = realSizeBaseplateCols * realSizeBaseplateRows;
+  const targetColorRgb = targetColorHex ? hexToRgb(targetColorHex) : null;
+  const selectedForChangeKeySet = new Set(selectedCellKeys);
+
+  if (grid?.length && selectedBrickHexes.length) {
+    for (let y = 0; y < grid.length; y++) {
+      for (let x = 0; x < grid[0].length; x++) {
+        if (selectedBrickHexSet.has(rgbToHex(grid[y][x].rgb))) {
+          selectedForChangeKeySet.add(`${x},${y}`);
+        }
+      }
+    }
+  }
+
+  const selectedColorHexSet = new Set();
+  const selectedColorHexes = [];
+  const addSelectedHex = (hex) => {
+    if (!hex || selectedColorHexSet.has(hex)) return;
+    selectedColorHexSet.add(hex);
+    selectedColorHexes.push(hex);
+  };
+
+  for (const hex of selectedBrickHexes) {
+    addSelectedHex(hex);
+  }
+
+  if (grid?.length && selectedCellKeys.length) {
+    for (const key of selectedCellKeys) {
+      const [xStr, yStr] = key.split(",");
+      const x = parseInt(xStr, 10);
+      const y = parseInt(yStr, 10);
+      if (Number.isNaN(x) || Number.isNaN(y)) continue;
+      if (y < 0 || y >= grid.length || x < 0 || x >= grid[0].length) continue;
+
+      addSelectedHex(rgbToHex(grid[y][x].rgb));
+    }
+  }
 
   const handleUpload = (e) => {
     const file = e.target.files[0];
@@ -120,8 +127,17 @@ function App() {
       setHoveredColor(null);
       setPickedColors([]);
       setGrid(null);
+      setOriginalGrid(null);
+      setGridHistory([]);
       setCounts([]);
       setSelectedBrickHexes([]);
+      setSelectedCellKeys([]);
+      setIsPainting(false);
+      setIsRealSizePreviewOpen(false);
+      setIsRealSizeFullscreen(false);
+      setIsRealSizeDragging(false);
+      setRealSizeScalePercent(100);
+      setTargetColorHex("");
     };
 
     img.src = URL.createObjectURL(file);
@@ -133,15 +149,182 @@ function App() {
 
     const source = sampleCanvasRef.current || image;
     const result = processImage(source, size, activePalette);
-    setGrid(result.grid);
+    const nextGrid = cloneGrid(result.grid);
+    setGrid(nextGrid);
+    setOriginalGrid(cloneGrid(nextGrid));
+    setGridHistory([]);
     setCounts(result.counts);
     setSelectedBrickHexes([]);
+    setSelectedCellKeys([]);
+    setIsPainting(false);
+    setIsRealSizePreviewOpen(false);
+    setIsRealSizeFullscreen(false);
+    setIsRealSizeDragging(false);
+    setRealSizeScalePercent(100);
+    setTargetColorHex(result.counts[0] ? rgbToHex(result.counts[0].rgb) : "");
   };
 
   const toggleSelectedBrick = (hex) => {
     setSelectedBrickHexes((prev) =>
       prev.includes(hex) ? prev.filter((item) => item !== hex) : [...prev, hex]
     );
+  };
+
+  const clampBrushSize = (value) => Math.min(brushMax, Math.max(1, value));
+
+  const getConnectedComponentKeys = (startX, startY) => {
+    if (!grid || !grid.length || !grid[0]?.length) return [];
+
+    const height = grid.length;
+    const width = grid[0].length;
+    const targetHex = rgbToHex(grid[startY][startX].rgb);
+    const queue = [[startX, startY]];
+    const visited = new Set();
+    const componentKeys = [];
+    const directions = [
+      [0, -1],
+      [0, 1],
+      [-1, 0],
+      [1, 0],
+    ];
+
+    while (queue.length) {
+      const [x, y] = queue.pop();
+      const key = `${x},${y}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+
+      if (rgbToHex(grid[y][x].rgb) !== targetHex) continue;
+      componentKeys.push(key);
+
+      for (const [dx, dy] of directions) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const nextKey = `${nx},${ny}`;
+        if (!visited.has(nextKey)) {
+          queue.push([nx, ny]);
+        }
+      }
+    }
+
+    return componentKeys;
+  };
+
+  const applyBrushAtCell = (centerX, centerY, mode) => {
+    if (!grid || !grid.length || !grid[0]?.length) return;
+
+    const height = grid.length;
+    const width = grid[0].length;
+    const radius = Math.max(0, brushSize - 1);
+
+    setSelectedCellKeys((prev) => {
+      const next = new Set(prev);
+
+      for (let y = Math.max(0, centerY - radius); y <= Math.min(height - 1, centerY + radius); y++) {
+        for (let x = Math.max(0, centerX - radius); x <= Math.min(width - 1, centerX + radius); x++) {
+          const dx = x - centerX;
+          const dy = y - centerY;
+          if (dx * dx + dy * dy > radius * radius) continue;
+
+          const key = `${x},${y}`;
+          if (mode === "add") {
+            next.add(key);
+          } else {
+            next.delete(key);
+          }
+        }
+      }
+
+      return [...next];
+    });
+  };
+
+  const applyConnectedComponentAtCell = (centerX, centerY) => {
+    const componentKeys = getConnectedComponentKeys(centerX, centerY);
+    if (!componentKeys.length) return;
+
+    setSelectedCellKeys((prev) => {
+      const next = new Set(prev);
+      const isSelectedComponent = componentKeys.every((key) => next.has(key));
+
+      for (const key of componentKeys) {
+        if (isSelectedComponent) {
+          next.delete(key);
+        } else {
+          next.add(key);
+        }
+      }
+
+      return [...next];
+    });
+  };
+
+  const handlePreviewCellMouseDown = (event, x, y) => {
+    event.preventDefault();
+    setIsPainting(true);
+    if (paintTool === "wand") {
+      applyConnectedComponentAtCell(x, y);
+      return;
+    }
+    applyBrushAtCell(x, y, paintMode);
+  };
+
+  const handlePreviewCellMouseEnter = (x, y) => {
+    if (!isPainting) return;
+    if (paintTool === "wand") {
+      applyConnectedComponentAtCell(x, y);
+      return;
+    }
+    applyBrushAtCell(x, y, paintMode);
+  };
+
+  const applySelectedColorChange = () => {
+    if (!grid?.length || !selectedForChangeKeySet.size || !targetColorHex) return;
+
+    const targetRgb = hexToRgb(targetColorHex);
+    const targetColor = {
+      id: Date.now(),
+      name: targetColorHex,
+      rgb: targetRgb,
+    };
+    const nextGrid = grid.map((row, y) =>
+      row.map((cell, x) => (selectedForChangeKeySet.has(`${x},${y}`) ? targetColor : cell))
+    );
+
+    const nextCounts = buildCountsFromGrid(nextGrid);
+    const availableHexes = new Set(nextCounts.map((item) => rgbToHex(item.rgb)));
+
+    setGridHistory((prev) => [...prev, cloneGrid(grid)]);
+    setGrid(nextGrid);
+    setCounts(nextCounts);
+    setSelectedBrickHexes((prev) => prev.filter((hex) => availableHexes.has(hex)));
+  };
+
+  const undoLastGridChange = () => {
+    if (!gridHistory.length) return;
+
+    const previousGrid = cloneGrid(gridHistory[gridHistory.length - 1]);
+    const previousCounts = buildCountsFromGrid(previousGrid);
+    const availableHexes = new Set(previousCounts.map((item) => rgbToHex(item.rgb)));
+
+    setGrid(previousGrid);
+    setCounts(previousCounts);
+    setGridHistory((prev) => prev.slice(0, -1));
+    setSelectedBrickHexes((prev) => prev.filter((hex) => availableHexes.has(hex)));
+  };
+
+  const restoreOriginalGrid = () => {
+    if (!originalGrid?.length) return;
+
+    const restoredGrid = cloneGrid(originalGrid);
+    const restoredCounts = buildCountsFromGrid(restoredGrid);
+    const availableHexes = new Set(restoredCounts.map((item) => rgbToHex(item.rgb)));
+
+    setGrid(restoredGrid);
+    setCounts(restoredCounts);
+    setGridHistory([]);
+    setSelectedBrickHexes((prev) => prev.filter((hex) => availableHexes.has(hex)));
   };
 
   const updatePaletteName = (id, name) => {
@@ -262,6 +445,141 @@ function App() {
     setRecommendationMode(nextMode);
   };
 
+  const closeRealSizePreview = () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
+    setIsRealSizePreviewOpen(false);
+    setIsRealSizeFullscreen(false);
+    setIsRealSizeDragging(false);
+  };
+
+  const toggleRealSizeFullscreen = () => {
+    const element = realSizeModalRef.current;
+    if (!element) return;
+
+    if (document.fullscreenElement === element) {
+      document.exitFullscreen().catch(() => {});
+      return;
+    }
+
+    element.requestFullscreen().catch(() => {});
+  };
+
+  const handleRealSizePanStart = (event) => {
+    if (!isRealSizeFullscreen) return;
+    const viewport = realSizeViewportRef.current;
+    if (!viewport) return;
+
+    event.preventDefault();
+    setIsRealSizeDragging(true);
+    realSizePanStartRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+    };
+  };
+
+  useEffect(() => {
+    const endPainting = () => setIsPainting(false);
+    window.addEventListener("mouseup", endPainting);
+    return () => {
+      window.removeEventListener("mouseup", endPainting);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isRealSizePreviewOpen) return;
+
+    const handleEscClose = (event) => {
+      if (event.key === "Escape") {
+        if (isRealSizeFullscreen) {
+          document.exitFullscreen().catch(() => {});
+          return;
+        }
+        setIsRealSizePreviewOpen(false);
+        setIsRealSizeFullscreen(false);
+        setIsRealSizeDragging(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleEscClose);
+    return () => {
+      window.removeEventListener("keydown", handleEscClose);
+    };
+  }, [isRealSizeFullscreen, isRealSizePreviewOpen]);
+
+  useEffect(() => {
+    if (!isRealSizePreviewOpen) return;
+
+    const handleFullscreenChange = () => {
+      const isActive = document.fullscreenElement === realSizeModalRef.current;
+      setIsRealSizeFullscreen(isActive);
+      if (!isActive) {
+        setIsRealSizeDragging(false);
+      }
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    handleFullscreenChange();
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, [isRealSizePreviewOpen]);
+
+  useEffect(() => {
+    if (!isRealSizeDragging) return;
+
+    const handleMouseMove = (event) => {
+      const viewport = realSizeViewportRef.current;
+      const start = realSizePanStartRef.current;
+      if (!viewport || !start) return;
+
+      const dx = event.clientX - start.x;
+      const dy = event.clientY - start.y;
+      viewport.scrollLeft = start.scrollLeft - dx;
+      viewport.scrollTop = start.scrollTop - dy;
+    };
+
+    const handleMouseUp = () => {
+      setIsRealSizeDragging(false);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isRealSizeDragging]);
+
+  useEffect(() => {
+    setBrushSize((prev) => clampBrushSize(prev));
+  }, [brushMax]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth <= 768);
+    };
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!counts.length) {
+      if (targetColorHex) setTargetColorHex("");
+      return;
+    }
+
+    const availableHexes = counts.map((item) => rgbToHex(item.rgb));
+    if (!targetColorHex || !availableHexes.includes(targetColorHex)) {
+      setTargetColorHex(availableHexes[0]);
+    }
+  }, [counts, targetColorHex]);
+
   useEffect(() => {
     if (!image) return;
 
@@ -290,52 +608,8 @@ function App() {
     (color) => color.source !== "user-picked" && color.source !== "recommended"
   );
 
-  const renderPaletteSection = (title, colors) => {
-    if (!colors.length) return null;
-
-    return (
-      <div style={{ marginTop: 10 }}>
-        <div style={{ fontSize: 13, fontWeight: 700 }}>{title}</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6 }}>
-          {colors.map((color) => (
-            <div
-              key={color.id}
-              style={{ display: "flex", alignItems: "center", gap: 8 }}
-            >
-              <input
-                type="checkbox"
-                checked={color.enabled}
-                onChange={() => togglePaletteColor(color.id)}
-              />
-              <input
-                type="text"
-                value={color.name}
-                onChange={(e) => updatePaletteName(color.id, e.target.value)}
-                style={{ width: 130 }}
-              />
-              <input
-                type="color"
-                value={rgbToHex(color.rgb)}
-                onChange={(e) => updatePaletteRgb(color.id, e.target.value)}
-              />
-              <span
-                style={{
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  opacity: 0.8,
-                }}
-              >
-                {rgbToHex(color.rgb)}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  };
-
   return (
-    <div style={{ padding: 20 }}>
+    <div style={{ padding: isMobile ? 12 : 20 }}>
       <h2>레고 아트 도안 생성기</h2>
 
       <input type="file" onChange={handleUpload} />
@@ -346,9 +620,10 @@ function App() {
             style={{
               marginTop: 8,
               display: "flex",
-              gap: 16,
+              gap: isMobile ? 10 : 16,
               alignItems: "flex-start",
-              flexWrap: "wrap",
+              flexWrap: isMobile ? "nowrap" : "wrap",
+              flexDirection: isMobile ? "column" : "row",
             }}
           >
             <img
@@ -366,7 +641,7 @@ function App() {
                 cursor: "crosshair",
               }}
             />
-            <div style={{ minWidth: 180 }}>
+            <div style={{ minWidth: isMobile ? "100%" : 180, width: isMobile ? "100%" : "auto" }}>
               <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>
                 보정
               </div>
@@ -572,9 +847,33 @@ function App() {
       </button>
 
       <h3>팔레트 선택/수정</h3>
-      {renderPaletteSection("사용자 선택 색상 팔레트", userPickedPalette)}
-      {renderPaletteSection("추천 색상 팔레트", recommendedPalette)}
-      {renderPaletteSection("기본/기타 팔레트", otherPalette)}
+      <PaletteSection
+        title="사용자 선택 색상 팔레트"
+        colors={userPickedPalette}
+        isMobile={isMobile}
+        rgbToHex={rgbToHex}
+        onToggleColor={togglePaletteColor}
+        onUpdateName={updatePaletteName}
+        onUpdateRgb={updatePaletteRgb}
+      />
+      <PaletteSection
+        title="추천 색상 팔레트"
+        colors={recommendedPalette}
+        isMobile={isMobile}
+        rgbToHex={rgbToHex}
+        onToggleColor={togglePaletteColor}
+        onUpdateName={updatePaletteName}
+        onUpdateRgb={updatePaletteRgb}
+      />
+      <PaletteSection
+        title="기본/기타 팔레트"
+        colors={otherPalette}
+        isMobile={isMobile}
+        rgbToHex={rgbToHex}
+        onToggleColor={togglePaletteColor}
+        onUpdateName={updatePaletteName}
+        onUpdateRgb={updatePaletteRgb}
+      />
 
       <div style={{ marginTop: 8, fontSize: 13 }}>
         사용 중인 색상: {activeColorCount}개
@@ -594,9 +893,10 @@ function App() {
           <div
             style={{
               display: "flex",
-              gap: 24,
+              gap: isMobile ? 12 : 24,
               alignItems: "flex-start",
-              flexWrap: "wrap",
+              flexWrap: isMobile ? "nowrap" : "wrap",
+              flexDirection: isMobile ? "column" : "row",
             }}
           >
             <div>
@@ -617,7 +917,196 @@ function App() {
             </div>
 
             <div>
-              <h4 style={{ marginTop: 0 }}>도안 미리보기</h4>
+              <div
+                style={{
+                  marginTop: 0,
+                  marginBottom: 10,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <h4 style={{ margin: 0 }}>도안 미리보기</h4>
+                <button type="button" onClick={() => setIsRealSizePreviewOpen(true)}>
+                  실제 크기로 보기
+                </button>
+              </div>
+              <div
+                style={{
+                  marginBottom: 10,
+                  padding: 8,
+                  border: "1px solid #ddd",
+                  borderRadius: 6,
+                  display: "flex",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  gap: 10,
+                }}
+              >
+                <span style={{ fontSize: 12, fontWeight: 700 }}>선택된 색</span>
+                <div style={{ display: "flex", gap: 6, minHeight: 24 }}>
+                  {selectedColorHexes.length ? (
+                    selectedColorHexes.map((hex) => (
+                      <button
+                        key={`selected-${hex}`}
+                        type="button"
+                        title={hex}
+                        style={{
+                          width: 22,
+                          height: 22,
+                          borderRadius: "50%",
+                          border: "1px solid #888",
+                          background: hex,
+                        }}
+                      />
+                    ))
+                  ) : (
+                    <span style={{ fontSize: 12, opacity: 0.7 }}>없음</span>
+                  )}
+                </div>
+                <span style={{ fontSize: 12, opacity: 0.8 }}>-&gt;</span>
+                <span style={{ fontSize: 12, fontWeight: 700 }}>변경 색</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, minHeight: 24 }}>
+                  {counts.map((item, index) => {
+                    const hex = rgbToHex(item.rgb);
+                    const isActive = hex === targetColorHex;
+                    return (
+                      <button
+                        key={`target-${hex}-${index}`}
+                        type="button"
+                        onClick={() => setTargetColorHex(hex)}
+                        title={hex}
+                        style={{
+                          width: 22,
+                          height: 22,
+                          borderRadius: "50%",
+                          border: isActive ? "2px solid #222" : "1px solid #888",
+                          background: hex,
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  onClick={applySelectedColorChange}
+                  disabled={!selectedForChangeKeySet.size || !targetColorHex}
+                >
+                  변경
+                </button>
+                <button
+                  type="button"
+                  onClick={undoLastGridChange}
+                  disabled={!gridHistory.length}
+                >
+                  이전 단계
+                </button>
+                <button
+                  type="button"
+                  onClick={restoreOriginalGrid}
+                  disabled={!originalGrid?.length}
+                >
+                  오리지널 도안
+                </button>
+              </div>
+              <div
+                style={{
+                  marginBottom: 8,
+                  display: "flex",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPaintTool("brush");
+                    setPaintMode("add");
+                  }}
+                  style={{
+                    minWidth: 32,
+                    fontWeight: 700,
+                    background:
+                      paintTool === "brush" && paintMode === "add"
+                        ? "#d7f6df"
+                        : "transparent",
+                    border: "1px solid #8fbf9f",
+                    borderRadius: 4,
+                  }}
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPaintTool("brush");
+                    setPaintMode("remove");
+                  }}
+                  style={{
+                    minWidth: 32,
+                    fontWeight: 700,
+                    background:
+                      paintTool === "brush" && paintMode === "remove"
+                        ? "#ffdede"
+                        : "transparent",
+                    border: "1px solid #d4a0a0",
+                    borderRadius: 4,
+                  }}
+                >
+                  -
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPaintTool((prev) => (prev === "wand" ? "brush" : "wand"))}
+                  style={{
+                    minWidth: 56,
+                    fontWeight: 700,
+                    background: paintTool === "wand" ? "#fff2cc" : "transparent",
+                    border: "1px solid #c8b36b",
+                    borderRadius: 4,
+                  }}
+                >
+                  마법봉
+                </button>
+                <span style={{ fontSize: 12, opacity: 0.9 }}>브러시 크기</span>
+                <button
+                  type="button"
+                  onClick={() => setBrushSize((prev) => clampBrushSize(prev - 1))}
+                  disabled={paintTool === "wand" || brushSize <= 1}
+                >
+                  -
+                </button>
+                <input
+                  type="range"
+                  min={1}
+                  max={brushMax}
+                  value={brushSize}
+                  onChange={(e) => setBrushSize(clampBrushSize(parseInt(e.target.value, 10)))}
+                  disabled={paintTool === "wand"}
+                />
+                <button
+                  type="button"
+                  onClick={() => setBrushSize((prev) => clampBrushSize(prev + 1))}
+                  disabled={paintTool === "wand" || brushSize >= brushMax}
+                >
+                  +
+                </button>
+                <input
+                  type="number"
+                  min={1}
+                  max={brushMax}
+                  value={brushSize}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value, 10);
+                    if (Number.isNaN(value)) return;
+                    setBrushSize(clampBrushSize(value));
+                  }}
+                  disabled={paintTool === "wand"}
+                  style={{ width: 56 }}
+                />
+              </div>
               <div
                 style={{
                   display: "grid",
@@ -625,16 +1114,26 @@ function App() {
                   maxWidth: "100%",
                   gridTemplateColumns: `repeat(${grid[0]?.length || size}, 1fr)`,
                   border: "1px solid #ccc",
+                  userSelect: "none",
                 }}
+                onMouseUp={() => setIsPainting(false)}
+                onMouseLeave={() => setIsPainting(false)}
               >
                 {grid.flat().map((cell, index) => {
+                  const width = grid[0]?.length || size;
+                  const x = index % width;
+                  const y = Math.floor(index / width);
+                  const cellKey = `${x},${y}`;
                   const hex = rgbToHex(cell.rgb);
-                  const isSelected = selectedBrickHexSet.has(hex);
+                  const isSelected =
+                    selectedBrickHexSet.has(hex) || selectedCellKeySet.has(cellKey);
 
                   return (
                     <div
                       key={index}
                       title={`${cell.name} ${hex}`}
+                      onMouseDown={(event) => handlePreviewCellMouseDown(event, x, y)}
+                      onMouseEnter={() => handlePreviewCellMouseEnter(x, y)}
                       style={{
                         width: "100%",
                         aspectRatio: "1 / 1",
@@ -642,15 +1141,86 @@ function App() {
                         backgroundImage: isSelected
                           ? "linear-gradient(rgba(255, 0, 0, 0.28), rgba(255, 0, 0, 0.28)), repeating-linear-gradient(0deg, rgba(255, 0, 0, 0.5) 0 1px, transparent 1px 4px), repeating-linear-gradient(90deg, rgba(255, 0, 0, 0.5) 0 1px, transparent 1px 4px)"
                           : "none",
+                        cursor: "pointer",
                       }}
                     />
                   );
                 })}
               </div>
             </div>
+
+            <div>
+              <h4 style={{ marginTop: 0 }}>변경사항 미리보기</h4>
+              <div
+                style={{
+                  display: "grid",
+                  width: previewWidth,
+                  maxWidth: "100%",
+                  gridTemplateColumns: `repeat(${grid[0]?.length || size}, 1fr)`,
+                  border: "1px solid #ccc",
+                  userSelect: "none",
+                }}
+              >
+                {grid.flat().map((cell, index) => {
+                  const width = grid[0]?.length || size;
+                  const x = index % width;
+                  const y = Math.floor(index / width);
+                  const cellKey = `${x},${y}`;
+                  const willChange =
+                    Boolean(targetColorRgb) &&
+                    selectedForChangeKeySet.has(cellKey) &&
+                    rgbToHex(cell.rgb) !== targetColorHex;
+                  const previewRgb = willChange ? targetColorRgb : cell.rgb;
+                  const previewHex = rgbToHex(previewRgb);
+
+                  return (
+                    <div
+                      key={`preview-${index}`}
+                      title={`${cell.name} ${previewHex}`}
+                      style={{
+                        width: "100%",
+                        aspectRatio: "1 / 1",
+                        backgroundColor: `rgb(${previewRgb.join(",")})`,
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
+                선택 영역 + 변경 색을 고르면 여기서 적용 결과를 먼저 확인할 수 있어.
+              </div>
+            </div>
           </div>
 
-          <h3>브릭 개수</h3>
+          <RealSizePreviewModal
+            isOpen={isRealSizePreviewOpen}
+            onClose={closeRealSizePreview}
+            modalRef={realSizeModalRef}
+            viewportRef={realSizeViewportRef}
+            onPanStart={handleRealSizePanStart}
+            isFullscreen={isRealSizeFullscreen}
+            isDragging={isRealSizeDragging}
+            onToggleFullscreen={toggleRealSizeFullscreen}
+            realSizeScalePercent={realSizeScalePercent}
+            onChangeScalePercent={setRealSizeScalePercent}
+            onResetScale={() => setRealSizeScalePercent(100)}
+            realSizeModelWidthMm={realSizeModelWidthMm}
+            realSizeModelHeightMm={realSizeModelHeightMm}
+            realSizeBaseplateCols={realSizeBaseplateCols}
+            realSizeBaseplateRows={realSizeBaseplateRows}
+            realSizeBaseplateCount={realSizeBaseplateCount}
+            grid={grid}
+            size={size}
+            realSizeGridWidthPx={realSizeGridWidthPx}
+            realSizeGridHeightPx={realSizeGridHeightPx}
+            realSizePitchPx={realSizePitchPx}
+            realSizeBaseplateStepPx={realSizeBaseplateStepPx}
+            realSizeBrickOuterDiameterPx={realSizeBrickOuterDiameterPx}
+          />
+
+          <h3>
+            브릭 개수 <span style={{ fontSize: 14, fontWeight: 500 }}>(총 {totalBrickCount}개)</span>
+          </h3>
 
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {counts.map((item, index) => (
