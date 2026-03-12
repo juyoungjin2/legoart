@@ -5,10 +5,38 @@ import PaletteSection from "./components/PaletteSection";
 import RealSizePreviewModal from "./components/RealSizePreviewModal";
 import { hexToRgb, rgbToHex } from "./utils/colorUtils";
 import { buildCountsFromGrid, cloneGrid } from "./utils/gridUtils";
+import { downloadBrickBlueprintPdf } from "./utils/blueprintPdf";
 import {
   createAdjustedCanvas,
   extractGrayscaleRecommendations,
 } from "./utils/imageUtils";
+
+const RECOMMENDATION_CASE_SIZES = [10, 13, 16, 20];
+
+function pickEvenlySpaced(list, count) {
+  if (!list.length || count <= 0) return [];
+  if (count >= list.length) return list;
+
+  const picked = [];
+  const used = new Set();
+  for (let i = 0; i < count; i++) {
+    const q = count === 1 ? 0 : i / (count - 1);
+    const index = Math.min(list.length - 1, Math.round(q * (list.length - 1)));
+    if (!used.has(index)) {
+      used.add(index);
+      picked.push(list[index]);
+    }
+  }
+
+  if (picked.length === count) return picked;
+  for (let i = 0; i < list.length && picked.length < count; i++) {
+    if (used.has(i)) continue;
+    used.add(i);
+    picked.push(list[i]);
+  }
+
+  return picked;
+}
 
 function App() {
   const sampleCanvasRef = useRef(null);
@@ -34,11 +62,18 @@ function App() {
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [size, setSize] = useState(48);
   const [brickSizeMm, setBrickSizeMm] = useState(8);
+  const [boundarySmoothing, setBoundarySmoothing] = useState(60);
   const [brightness, setBrightness] = useState(100);
   const [contrast, setContrast] = useState(100);
   const [saturation, setSaturation] = useState(100);
   const [adjustedPreviewSrc, setAdjustedPreviewSrc] = useState("");
-  const [recommendedColors, setRecommendedColors] = useState([]);
+  const [recommendedColorCases, setRecommendedColorCases] = useState({
+    10: [],
+    13: [],
+    16: [],
+    20: [],
+  });
+  const [recommendationCaseSize, setRecommendationCaseSize] = useState(20);
   const [recommendationMode, setRecommendationMode] = useState("normal");
   const [selectedRecommendationIndexes, setSelectedRecommendationIndexes] =
     useState([]);
@@ -78,6 +113,7 @@ function App() {
   const realSizeBaseplateCols = Math.ceil((grid?.[0]?.length || 0) / lego65803StudsPerSide);
   const realSizeBaseplateRows = Math.ceil((grid?.length || 0) / lego65803StudsPerSide);
   const realSizeBaseplateCount = realSizeBaseplateCols * realSizeBaseplateRows;
+  const recommendedColors = recommendedColorCases[recommendationCaseSize] || [];
   const targetColorRgb = targetColorHex ? hexToRgb(targetColorHex) : null;
   const selectedForChangeKeySet = new Set(selectedCellKeys);
 
@@ -123,6 +159,8 @@ function App() {
 
     img.onload = () => {
       setImage(img);
+      setRecommendedColorCases({ 10: [], 13: [], 16: [], 20: [] });
+      setRecommendationCaseSize(20);
       setSelectedRecommendationIndexes([]);
       setHoveredColor(null);
       setPickedColors([]);
@@ -148,7 +186,9 @@ function App() {
     if (!activePalette.length) return;
 
     const source = sampleCanvasRef.current || image;
-    const result = processImage(source, size, activePalette);
+    const result = processImage(source, size, activePalette, {
+      boundarySmoothing,
+    });
     const nextGrid = cloneGrid(result.grid);
     setGrid(nextGrid);
     setOriginalGrid(cloneGrid(nextGrid));
@@ -445,6 +485,10 @@ function App() {
     setRecommendationMode(nextMode);
   };
 
+  const handleDownloadBlueprintPdf = async () => {
+    await downloadBrickBlueprintPdf({ grid, counts });
+  };
+
   const closeRealSizePreview = () => {
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
@@ -593,14 +637,31 @@ function App() {
 
     sampleCanvasRef.current = adjustedCanvas;
     setAdjustedPreviewSrc(adjustedCanvas.toDataURL());
-    setRecommendedColors(
-      recommendationMode === "grayscale"
-        ? extractGrayscaleRecommendations(adjustedCanvas, 7)
-        : extractDominantColors(adjustedCanvas, 20)
-    );
+    if (recommendationMode === "grayscale") {
+      const base = extractGrayscaleRecommendations(adjustedCanvas, 20);
+      setRecommendedColorCases({
+        10: pickEvenlySpaced(base, 10),
+        13: pickEvenlySpaced(base, 13),
+        16: pickEvenlySpaced(base, 16),
+        20: pickEvenlySpaced(base, 20),
+      });
+    } else {
+      setRecommendedColorCases({
+        10: extractDominantColors(adjustedCanvas, 10, { groupSimilar: true }),
+        13: extractDominantColors(adjustedCanvas, 13, { groupSimilar: true }),
+        16: extractDominantColors(adjustedCanvas, 16, { groupSimilar: true }),
+        20: extractDominantColors(adjustedCanvas, 20, { groupSimilar: true }),
+      });
+    }
     setSelectedRecommendationIndexes([]);
     setHoveredColor(null);
   }, [image, recommendationMode, brightness, contrast, saturation]);
+
+  useEffect(() => {
+    setSelectedRecommendationIndexes((prev) =>
+      prev.filter((index) => index >= 0 && index < recommendedColors.length)
+    );
+  }, [recommendedColors.length, recommendationCaseSize]);
 
   const userPickedPalette = palette.filter((color) => color.source === "user-picked");
   const recommendedPalette = palette.filter((color) => color.source === "recommended");
@@ -760,6 +821,16 @@ function App() {
         예상 최종 작품 크기: {finalWidthMm.toFixed(1)}mm x {" "}
         {finalHeightMm.toFixed(1)}mm
       </div>
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontSize: 13 }}>경계 정리 강도: {boundarySmoothing}</div>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          value={boundarySmoothing}
+          onChange={(e) => setBoundarySmoothing(parseInt(e.target.value, 10))}
+        />
+      </div>
 
       <h3>사진 주요 색상 추천</h3>
       <button
@@ -777,6 +848,39 @@ function App() {
       >
         전체 선택
       </button>
+      <div
+        style={{
+          marginBottom: 10,
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
+        <span style={{ fontSize: 12, opacity: 0.9 }}>추천 케이스</span>
+        {RECOMMENDATION_CASE_SIZES.map((caseSize) => {
+          const isActive = recommendationCaseSize === caseSize;
+          return (
+            <button
+              key={`case-${caseSize}`}
+              type="button"
+              onClick={() => {
+                setRecommendationCaseSize(caseSize);
+                setSelectedRecommendationIndexes([]);
+              }}
+              style={{
+                minWidth: 52,
+                fontWeight: 700,
+                borderRadius: 4,
+                border: isActive ? "2px solid #1f4f7f" : "1px solid #a8b5c2",
+                background: isActive ? "#eaf4ff" : "transparent",
+              }}
+            >
+              {caseSize}개
+            </button>
+          );
+        })}
+      </div>
       {recommendedColors.length > 0 ? (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
           {recommendedColors.map((item, index) => (
@@ -889,6 +993,11 @@ function App() {
 
       {grid && (
         <div>
+          <div style={{ marginTop: 10, marginBottom: 10 }}>
+            <button type="button" onClick={handleDownloadBlueprintPdf}>
+              브릭 도안 PDF 다운로드 (16x16 판, A4 1장당 6판)
+            </button>
+          </div>
           <h3>전후 비교</h3>
           <div
             style={{

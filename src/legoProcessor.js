@@ -36,6 +36,96 @@ function chroma(rgb) {
   return Math.max(rgb[0], rgb[1], rgb[2]) - Math.min(rgb[0], rgb[1], rgb[2]);
 }
 
+function rgbToHue(rgb) {
+  const r = rgb[0] / 255;
+  const g = rgb[1] / 255;
+  const b = rgb[2] / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+
+  if (delta === 0) return 0;
+  let hue;
+  if (max === r) {
+    hue = ((g - b) / delta) % 6;
+  } else if (max === g) {
+    hue = (b - r) / delta + 2;
+  } else {
+    hue = (r - g) / delta + 4;
+  }
+
+  return (hue * 60 + 360) % 360;
+}
+
+function colorFamilyKey(rgb) {
+  const c = chroma(rgb);
+  const b = brightness(rgb);
+  if (c < 18) {
+    if (b < 75) return "neutral-dark";
+    if (b > 180) return "neutral-light";
+    return "neutral-mid";
+  }
+
+  const hue = rgbToHue(rgb);
+  if (hue < 20 || hue >= 340) return "red";
+  if (hue < 55) return "orange";
+  if (hue < 80) return "yellow";
+  if (hue < 165) return "green";
+  if (hue < 250) return "blue";
+  if (hue < 300) return "purple";
+  return "pink";
+}
+
+function mergeSimilarColors(candidates, distanceThreshold = 34) {
+  if (!candidates.length) return [];
+
+  const total = candidates.reduce((sum, item) => sum + item.count, 0) || 1;
+  const groups = [];
+
+  for (const item of candidates) {
+    const family = colorFamilyKey(item.rgb);
+    let targetGroup = null;
+
+    for (const group of groups) {
+      if (group.family !== family) continue;
+      if (Math.abs(brightness(item.rgb) - brightness(group.rgb)) > 34) continue;
+      if (colorDistance(item.rgb, group.rgb) > distanceThreshold) continue;
+      targetGroup = group;
+      break;
+    }
+
+    if (!targetGroup) {
+      groups.push({
+        family,
+        count: item.count,
+        sumR: item.rgb[0] * item.count,
+        sumG: item.rgb[1] * item.count,
+        sumB: item.rgb[2] * item.count,
+        rgb: [...item.rgb],
+      });
+      continue;
+    }
+
+    targetGroup.count += item.count;
+    targetGroup.sumR += item.rgb[0] * item.count;
+    targetGroup.sumG += item.rgb[1] * item.count;
+    targetGroup.sumB += item.rgb[2] * item.count;
+    targetGroup.rgb = [
+      Math.round(targetGroup.sumR / targetGroup.count),
+      Math.round(targetGroup.sumG / targetGroup.count),
+      Math.round(targetGroup.sumB / targetGroup.count),
+    ];
+  }
+
+  return groups
+    .map((group) => ({
+      rgb: group.rgb,
+      count: group.count,
+      ratio: group.count / total,
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
 function pickLineBaseColor(palette) {
   if (!palette.length) return null;
 
@@ -92,8 +182,36 @@ function pickDiverseColors(candidates, maxColors, minDistance = 52) {
   return selected;
 }
 
-function smoothColorBoundaries(grid, cellStats) {
+function clampStrength(value) {
+  return Math.max(0, Math.min(100, value));
+}
+
+function smoothingConfig(strength) {
+  const s = clampStrength(strength);
+
+  if (s === 0) {
+    return {
+      enabled: false,
+      pass1MajorityMin: 99,
+      ownSupportKeepMin: 99,
+      pass2MajorityMin: 99,
+      distanceAllowance: 0,
+    };
+  }
+
+  return {
+    enabled: true,
+    pass1MajorityMin: Math.max(3, Math.round(6 - (s / 100) * 3)),
+    ownSupportKeepMin: Math.min(3, Math.max(1, Math.round(1 + (s / 100) * 2))),
+    pass2MajorityMin: Math.max(3, Math.round(5 - (s / 100) * 2)),
+    distanceAllowance: Math.round(8 + (s / 100) * 24),
+  };
+}
+
+function smoothColorBoundaries(grid, cellStats, strength = 50) {
   if (!grid?.length || !grid[0]?.length) return grid;
+  const config = smoothingConfig(strength);
+  if (!config.enabled) return grid;
 
   const height = grid.length;
   const width = grid[0].length;
@@ -138,7 +256,7 @@ function smoothColorBoundaries(grid, cellStats) {
         }
       }
 
-      if (bestKey !== currentKey && bestCount >= 5) {
+      if (bestKey !== currentKey && bestCount >= config.pass1MajorityMin) {
         next[y][x] = sampleByKey.get(bestKey);
       }
     }
@@ -167,7 +285,7 @@ function smoothColorBoundaries(grid, cellStats) {
       }
 
       const ownSupport = neighborCountByKey.get(currentKey) || 0;
-      if (ownSupport >= 2) continue;
+      if (ownSupport >= config.ownSupportKeepMin) continue;
 
       let bestKey = currentKey;
       let bestCount = ownSupport;
@@ -178,14 +296,14 @@ function smoothColorBoundaries(grid, cellStats) {
         }
       }
 
-      if (bestKey === currentKey || bestCount < 4) continue;
+      if (bestKey === currentKey || bestCount < config.pass2MajorityMin) continue;
 
       const target = sampleByKey.get(bestKey);
       const avgRgb = cellStats[y][x].avgRgb;
       const currentDist = colorDistance(avgRgb, current.rgb);
       const targetDist = colorDistance(avgRgb, target.rgb);
 
-      if (targetDist <= currentDist + 18) {
+      if (targetDist <= currentDist + config.distanceAllowance) {
         pass2[y][x] = target;
       }
     }
@@ -194,7 +312,7 @@ function smoothColorBoundaries(grid, cellStats) {
   return pass2;
 }
 
-export function extractDominantColors(image, maxColors = 20) {
+export function extractDominantColors(image, maxColors = 20, options = {}) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
   if (!ctx) return [];
@@ -256,13 +374,21 @@ export function extractDominantColors(image, maxColors = 20) {
     })
     .sort((a, b) => b.count - a.count);
 
-  return pickDiverseColors(sorted, maxColors);
+  const shouldGroupSimilar = options.groupSimilar !== false;
+  const grouped = shouldGroupSimilar
+    ? mergeSimilarColors(sorted, options.similarDistance || 34)
+    : sorted;
+
+  return pickDiverseColors(grouped, maxColors, options.minDistance || 48);
 }
 
-export function processImage(image, gridSize, palette = defaultPalette) {
+export function processImage(image, gridSize, palette = defaultPalette, options = {}) {
   if (!palette.length) {
     return { grid: [], counts: [] };
   }
+
+  const boundarySmoothing =
+    typeof options.boundarySmoothing === "number" ? options.boundarySmoothing : 50;
 
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
@@ -375,7 +501,7 @@ export function processImage(image, gridSize, palette = defaultPalette) {
     }
   }
 
-  const cleanedResult = smoothColorBoundaries(result, cellStats);
+  const cleanedResult = smoothColorBoundaries(result, cellStats, boundarySmoothing);
   for (let y = 0; y < gridSize; y++) {
     result[y] = cleanedResult[y];
   }
