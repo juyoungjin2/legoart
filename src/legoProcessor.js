@@ -92,6 +92,108 @@ function pickDiverseColors(candidates, maxColors, minDistance = 52) {
   return selected;
 }
 
+function smoothColorBoundaries(grid, cellStats) {
+  if (!grid?.length || !grid[0]?.length) return grid;
+
+  const height = grid.length;
+  const width = grid[0].length;
+  const directions8 = [
+    [-1, -1],
+    [0, -1],
+    [1, -1],
+    [-1, 0],
+    [1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+  ];
+
+  // Pass 1: remove isolated speckles by following strong neighborhood majority.
+  let next = grid.map((row) => [...row]);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const current = grid[y][x];
+      const currentKey = current.rgb.join(",");
+      const neighborCountByKey = new Map();
+      const sampleByKey = new Map();
+
+      for (const [dx, dy] of directions8) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const color = grid[ny][nx];
+        const key = color.rgb.join(",");
+        neighborCountByKey.set(key, (neighborCountByKey.get(key) || 0) + 1);
+        if (!sampleByKey.has(key)) {
+          sampleByKey.set(key, color);
+        }
+      }
+
+      let bestKey = currentKey;
+      let bestCount = 0;
+      for (const [key, count] of neighborCountByKey.entries()) {
+        if (count > bestCount) {
+          bestKey = key;
+          bestCount = count;
+        }
+      }
+
+      if (bestKey !== currentKey && bestCount >= 5) {
+        next[y][x] = sampleByKey.get(bestKey);
+      }
+    }
+  }
+
+  // Pass 2: if current color has weak support, snap to dominant adjacent color
+  // only when it's not much farther from the original average cell color.
+  const pass2 = next.map((row) => [...row]);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const current = next[y][x];
+      const currentKey = current.rgb.join(",");
+      const neighborCountByKey = new Map();
+      const sampleByKey = new Map();
+
+      for (const [dx, dy] of directions8) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const color = next[ny][nx];
+        const key = color.rgb.join(",");
+        neighborCountByKey.set(key, (neighborCountByKey.get(key) || 0) + 1);
+        if (!sampleByKey.has(key)) {
+          sampleByKey.set(key, color);
+        }
+      }
+
+      const ownSupport = neighborCountByKey.get(currentKey) || 0;
+      if (ownSupport >= 2) continue;
+
+      let bestKey = currentKey;
+      let bestCount = ownSupport;
+      for (const [key, count] of neighborCountByKey.entries()) {
+        if (count > bestCount) {
+          bestKey = key;
+          bestCount = count;
+        }
+      }
+
+      if (bestKey === currentKey || bestCount < 4) continue;
+
+      const target = sampleByKey.get(bestKey);
+      const avgRgb = cellStats[y][x].avgRgb;
+      const currentDist = colorDistance(avgRgb, current.rgb);
+      const targetDist = colorDistance(avgRgb, target.rgb);
+
+      if (targetDist <= currentDist + 18) {
+        pass2[y][x] = target;
+      }
+    }
+  }
+
+  return pass2;
+}
+
 export function extractDominantColors(image, maxColors = 20) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
@@ -271,6 +373,11 @@ export function processImage(image, gridSize, palette = defaultPalette) {
     for (let y = 0; y < gridSize; y++) {
       result[y] = next[y];
     }
+  }
+
+  const cleanedResult = smoothColorBoundaries(result, cellStats);
+  for (let y = 0; y < gridSize; y++) {
+    result[y] = cleanedResult[y];
   }
 
   const countsByColor = new Map();
